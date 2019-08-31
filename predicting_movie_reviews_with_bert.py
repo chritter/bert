@@ -18,45 +18,23 @@ import pandas as pd
 import tensorflow as tf
 import tensorflow_hub as hub
 from datetime import datetime
-
-#pip install bert-tensorflow
-
-#import bert
-#from bert import run_classifier
-#from bert import optimization
-#from bert import tokenization
-import run_classifier
-import optimization
-import tokenization
-
-# Set the output directory for saving model file
-# Optionally, set a GCP bucket location
-
-OUTPUT_DIR = 'model'#@param {type:"string"}
-#@markdown Whether or not to clear/delete the directory and create a new one
-DO_DELETE = False #@param {type:"boolean"}
-#@markdown Set USE_BUCKET and BUCKET if you want to (optionally) store model output on GCP bucket.
-USE_BUCKET = False #@param {type:"boolean"}
-BUCKET = 'BUCKET_NAME' #@param {type:"string"}
-
-if USE_BUCKET:
-  OUTPUT_DIR = 'gs://{}/{}'.format(BUCKET, OUTPUT_DIR)
-  from google.colab import auth
-  auth.authenticate_user()
-
-if DO_DELETE:
-  try:
-    tf.gfile.DeleteRecursively(OUTPUT_DIR)
-  except:
-    # Doesn't matter if the directory didn't exist
-    pass
-tf.gfile.MakeDirs(OUTPUT_DIR)
-print('***** Model output directory: {} *****'.format(OUTPUT_DIR))
-
-
 from tensorflow import keras
 import os
 import re
+
+import run_classifier
+import optimization
+import tokenization
+import modeling
+
+# Set the output directory for saving model file
+OUTPUT_DIR = 'model'#@param {type:"string"}
+
+
+tf.gfile.MakeDirs(OUTPUT_DIR)
+print('***** Model output directory: {} *****'.format(OUTPUT_DIR))
+
+# <------------------ Load the data
 
 # Load all files from a directory in a DataFrame.
 def load_directory_data(directory):
@@ -104,12 +82,17 @@ test = test.sample(5000)
 
 print('columns of train file: ',train.columns)
 
+
+# <------------------ Prepare the training input
+
+print('prepare training input...')
 DATA_COLUMN = 'sentence'
 LABEL_COLUMN = 'polarity'
 # label_list is the list of labels, i.e. True, False or 0, 1 or 'dog', 'cat'
 label_list = [0, 1]
 
-# Use the InputExample class from BERT's run_classifier code to create examples from the data
+# Use the InputExample class from BERT's run_classifier code to create examples from the data. Each data point
+# wrapped into a InputExample class
 train_InputExamples = train.apply(lambda x: run_classifier.InputExample(guid=None, # Globally unique ID for bookkeeping, unused in this example
                                                                    text_a = x[DATA_COLUMN], 
                                                                    text_b = None, 
@@ -120,33 +103,26 @@ test_InputExamples = test.apply(lambda x: run_classifier.InputExample(guid=None,
                                                                    text_b = None, 
                                                                    label = x[LABEL_COLUMN]), axis = 1)
 
-# This is a path to an uncased (all lowercase) version of BERT
-BERT_MODEL_HUB = "https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1"
 
-def create_tokenizer_from_hub_module():
-  """Get the vocab file and casing info from the Hub module."""
-  with tf.Graph().as_default():
-    bert_module = hub.Module(BERT_MODEL_HUB)
-    print('signatures available: ',bert_module.get_signature_names())
-    tokenization_info = bert_module(signature="tokenization_info", as_dict=True)
-    with tf.Session() as sess:
-      # vocab_file contains the path to vocab.txt in the tf cache hub dir
-      # do_lower_case is simply a True boolean value
-      vocab_file, do_lower_case = sess.run([tokenization_info["vocab_file"],
-                                            tokenization_info["do_lower_case"]])
+# <------------------ Prepare tokenizer and do tokenization
 
-  # initialize tokenizer and wordpiecer functions with vocabulary
-  return tokenization.FullTokenizer(
-      vocab_file=vocab_file, do_lower_case=do_lower_case)
+BERT_VOCAB= 'data/uncased_L-12_H-768_A-12/vocab.txt'
+BERT_INIT_CHKPNT = 'data/uncased_L-12_H-768_A-12/bert_model'
+BERT_CONFIG = 'data/uncased_L-12_H-768_A-12/bert_config.json'
 
-# to cache the TF hub model
-os.environ["TFHUB_CACHE_DIR"] = '/Users/christian/Documents/Career/StatCan/Projects/EconomicEventDetection/TextClassification/bert/data/hub_data'
+print('prepare tokenizer')
 
-tokenizer = create_tokenizer_from_hub_module()
+# Checks whether the casing config is consistent with the checkpoint name.
+tokenization.validate_case_matches_checkpoint(do_lower_case=True,init_checkpoint=BERT_INIT_CHKPNT)
 
+# build the tokenizer
+tokenizer = tokenization.FullTokenizer(vocab_file=BERT_VOCAB,do_lower_case=True)
+
+print('created tokenizer')
 print('example tokenization:',tokenizer.tokenize("This here's an example of using the BERT tokenizer"))
 
 # We'll set sequences to be at most 128 tokens long. Note it includes 2 special tokens: [CLS] and [SEP]
+# I can increase it to 512 for our news data
 MAX_SEQ_LENGTH = 128
 
 # Convert our train and test features to InputFeatures that BERT understands.
@@ -154,25 +130,23 @@ MAX_SEQ_LENGTH = 128
 train_features = run_classifier.convert_examples_to_features(train_InputExamples, label_list, MAX_SEQ_LENGTH, tokenizer)
 test_features = run_classifier.convert_examples_to_features(test_InputExamples, label_list, MAX_SEQ_LENGTH, tokenizer)
 
-def create_model(is_predicting, input_ids, input_mask, segment_ids, labels,
+
+# <------------------ Prepare model
+
+
+def create_model(bert_config,is_predicting, input_ids, input_mask, segment_ids, labels,
                  num_labels):
-  """Creates a classification model."""
 
-  bert_module = hub.Module(
-      BERT_MODEL_HUB,
-      trainable=True)
-  bert_inputs = dict(
-      input_ids=input_ids,
-      input_mask=input_mask,
-      segment_ids=segment_ids)
-  bert_outputs = bert_module(
-      inputs=bert_inputs,
-      signature="tokens",
-      as_dict=True)
+  # this initializes the BERT model, see model code in modeling module!
+  model = modeling.BertModel(
+    config=bert_config,
+    is_training=not is_predicting,
+    input_ids=input_ids,
+    input_mask=input_mask,
+    token_type_ids=segment_ids)# ,
+    #use_one_hot_embeddings=use_one_hot_embeddings)
 
-  # Use "pooled_output" for classification tasks on an entire sentence.
-  # Use "sequence_outputs" for token-level output.
-  output_layer = bert_outputs["pooled_output"]
+  output_layer = model.get_pooled_output()
 
   hidden_size = output_layer.shape[-1].value
 
@@ -209,7 +183,7 @@ def create_model(is_predicting, input_ids, input_mask, segment_ids, labels,
 
 # model_fn_builder actually creates our model function
 # using the passed parameters for num_labels, learning_rate, etc.
-def model_fn_builder(num_labels, learning_rate, num_train_steps,
+def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_train_steps,
                      num_warmup_steps):
   """Returns `model_fn` closure for TPUEstimator."""
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -226,7 +200,7 @@ def model_fn_builder(num_labels, learning_rate, num_train_steps,
     if not is_predicting:
 
       # create the model, specifically for training
-      (loss, predicted_labels, log_probs) = create_model(
+      (loss, predicted_labels, log_probs) = create_model(bert_config,
         is_predicting, input_ids, input_mask, segment_ids, label_ids, num_labels)
 
       # creates optimizer operation, based on Adam and exponential decaying lr
@@ -284,8 +258,22 @@ def model_fn_builder(num_labels, learning_rate, num_train_steps,
             loss=loss,
             eval_metric_ops=eval_metrics)
     else:
+
+      # init weights (added CR)
+      tvars = tf.trainable_variables()
+      initialized_variable_names = {}
+      tf.logging.info("**** Trainable Variables **** ??? ",init_checkpoint)
+      if init_checkpoint:
+          print('start loading weights ',len(tvars),' from checkpoint ',init_checkpoint)
+          (assignment_map, initialized_variable_names
+           ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+          # load weight maps
+          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+          print('loading weights done')
+          tf.logging.info("**** Trainable Variables ****")
+
       # create the model specifically for predictions
-      (predicted_labels, log_probs) = create_model(
+      (predicted_labels, log_probs) = create_model(bert_config,
         is_predicting, input_ids, input_mask, segment_ids, label_ids, num_labels)
 
       predictions = {
@@ -308,7 +296,7 @@ NUM_TRAIN_EPOCHS = 3.0
 WARMUP_PROPORTION = 0.1
 # Model configs
 SAVE_CHECKPOINTS_STEPS = 500
-SAVE_SUMMARY_STEPS = 100
+SAVE_SUMMARY_STEPS = 10
 
 # Compute # train and warmup steps from batch size
 num_train_steps = int(len(train_features) / BATCH_SIZE * NUM_TRAIN_EPOCHS)
@@ -317,18 +305,28 @@ num_warmup_steps = int(num_train_steps * WARMUP_PROPORTION)
 print('num warmump steps: ',num_warmup_steps)
 print('num training steps: ',num_train_steps)
 
+
+# specifies the configurations for an Estimator run.
 # Specify outpit directory and number of checkpoint steps to save
+# model_dir: directory where model parameters, graph, etc are saved.
+# save_summary_steps: Save summaries every this many steps.
 run_config = tf.estimator.RunConfig(
     model_dir=OUTPUT_DIR,
     save_summary_steps=SAVE_SUMMARY_STEPS,
     save_checkpoints_steps=SAVE_CHECKPOINTS_STEPS)
 
+# build the model
+bert_config = modeling.BertConfig.from_json_file(BERT_CONFIG)
+
 model_fn = model_fn_builder(
+  bert_config=bert_config,
+  init_checkpoint = BERT_INIT_CHKPNT,
   num_labels=len(label_list),
   learning_rate=LEARNING_RATE,
   num_train_steps=num_train_steps,
   num_warmup_steps=num_warmup_steps)
 
+# initializes the estimator
 estimator = tf.estimator.Estimator(
   model_fn=model_fn,
   config=run_config,
@@ -341,6 +339,9 @@ train_input_fn = run_classifier.input_fn_builder(
     seq_length=MAX_SEQ_LENGTH,
     is_training=True,
     drop_remainder=False)
+
+
+# <------------------ Begin training
 
 print(f'Beginning Training!')
 current_time = datetime.now()
