@@ -15,120 +15,137 @@
 
 from sklearn.model_selection import train_test_split
 import pandas as pd
+import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
 from datetime import datetime
 from tensorflow import keras
 import os
 import re
+import sys
 
 import run_classifier
 import optimization
 import tokenization
 import modeling
 
+import mlflow
+mlflow.set_tracking_uri("http://localhost:5000")
+mlflow.set_experiment('EventDetection')
+from mlflow import tensorflow
+tensorflow.autolog(every_n_iter=1) #default 100
+
+# Parameters
+# ==================================================
+FLAGS = tf.flags.FLAGS
+
 # Set the output directory for saving model file
 OUTPUT_DIR = 'model'#@param {type:"string"}
 
+tf.flags.DEFINE_string("OUTPUT_DIR", 'models/model2',
+                       """Path to output dir""")
+tf.flags.DEFINE_string("train_data_file","data/aclImdb/aclImdb_train.csv",
+                       """Path to training data. Expect 'text' and 'label' columns """)
+tf.flags.DEFINE_string("test_data_file","data/aclImdb/aclImdb_test.csv",
+                       """Path to development data """)
+tf.flags.DEFINE_string("BERT_VOCAB","data/uncased_L-12_H-768_A-12/vocab.txt",
+                       """Path to BERT vocab file """)
+tf.flags.DEFINE_string("BERT_INIT_CHKPNT","data/uncased_L-12_H-768_A-12/bert_model.ckpt",
+                       """Path to BERT model checkpoint """)
+tf.flags.DEFINE_string("BERT_CONFIG","data/uncased_L-12_H-768_A-12/bert_config.json",
+                       """Path to BERT model config file """)
+tf.flags.DEFINE_integer("MAX_SEQ_LENGTH",128,
+                       """max length of (token?) sequence. can increase up to 512 """)
 
-tf.gfile.MakeDirs(OUTPUT_DIR)
-print('***** Model output directory: {} *****'.format(OUTPUT_DIR))
+# These hyperparameters are copied from this colab notebook (https://colab.sandbox.google.com/github/tensorflow/tpu/blob/master/tools/colab/bert_finetuning_with_cloud_tpus.ipynb)
+tf.flags.DEFINE_integer("BATCH_SIZE",32,
+                       """ batch size for training """)
+tf.flags.DEFINE_float("LEARNING_RATE",2e-5,
+                       """ learning rate for training """)
+tf.flags.DEFINE_float("NUM_TRAIN_EPOCHS",3,
+                       """ number of training epochs """)
+# Warmup is a period of time where hte learning rate
+# is small and gradually increases--usually helps training.
+tf.flags.DEFINE_float("WARMUP_PROPORTION",0.1,
+                       """ number of training epochs """)
+tf.flags.DEFINE_integer("SAVE_CHECKPOINTS_STEPS",500,
+                       """ number of checkpoints to save """)
+tf.flags.DEFINE_integer("SAVE_SUMMARY_STEPS",100,
+                       """ number of checkpoints to save """)
+FLAGS = tf.flags.FLAGS
+FLAGS(sys.argv, known_only=True)
+
+# <--------- run specific settings
+
+FLAGS.SAVE_CHECKPOINTS_STEPS=2
+FLAGS.SAVE_SUMMARY_STEPS=1
+FLAGS.OUTPUT_DIR = 'models/model2'
+
+
+
+
+for key, values in FLAGS.flag_values_dict().items():
+    mlflow.log_param(key,values)
+
+# end of parameters
+
+
+tf.gfile.MakeDirs(FLAGS.OUTPUT_DIR)
+
+tf.logging.info('***** Model output directory: {} *****'.format(OUTPUT_DIR))
 
 # <------------------ Load the data
 
 # Load all files from a directory in a DataFrame.
-def load_directory_data(directory):
-  data = {}
-  data["sentence"] = []
-  data["sentiment"] = []
-  for file_path in os.listdir(directory):
-    with tf.gfile.GFile(os.path.join(directory, file_path), "r") as f:
-      data["sentence"].append(f.read())
-      data["sentiment"].append(re.match("\d+_(\d+)\.txt", file_path).group(1))
-  return pd.DataFrame.from_dict(data)
-
-# Merge positive and negative examples, add a polarity column and shuffle.
-def load_dataset(directory):
-  pos_df = load_directory_data(os.path.join(directory, "pos"))
-  neg_df = load_directory_data(os.path.join(directory, "neg"))
-  pos_df["polarity"] = 1
-  neg_df["polarity"] = 0
-  return pd.concat([pos_df, neg_df]).sample(frac=1).reset_index(drop=True)
-
-# Download and process the dataset files.
-def download_and_load_datasets(force_download=False):
-  dataset = tf.keras.utils.get_file(
-      fname="aclImdb.tar.gz", 
-      origin="http://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz", 
-      extract=True,
-      cache_subdir='/Users/christian/Documents/Career/StatCan/Projects/EconomicEventDetection/TextClassification/bert/data')
-
-  print('load data from ',os.path.join(os.path.dirname(dataset),
-                                       "aclImdb", "train"))
-  train_df = load_dataset(os.path.join(os.path.dirname(dataset), 
-                                       "aclImdb", "train"))
-  test_df = load_dataset(os.path.join(os.path.dirname(dataset), 
-                                      "aclImdb", "test"))
-  
-  return train_df, test_df
-
-
-train, test = download_and_load_datasets()
-
-print('total size of data: ',train.shape,test.shape)
-
+train = pd.read_csv(FLAGS.train_data_file)
+test = pd.read_csv(FLAGS.test_data_file)
 train = train.sample(5000)
 test = test.sample(5000)
 
-print('columns of train file: ',train.columns)
+# label_list is the list of labels, i.e. True, False or 0, 1 or 'dog', 'cat'
+label_list = list(np.unique(train['label'])) #[0, 1]
+
+tf.logging.info('shape of data: train: (%d,%d), test: (%d,%d)' % (train.shape+test.shape))
+tf.logging.info('columns of train file: %s' % ','.join(train.columns))
 
 
 # <------------------ Prepare the training input
 
-print('prepare training input...')
-DATA_COLUMN = 'sentence'
-LABEL_COLUMN = 'polarity'
-# label_list is the list of labels, i.e. True, False or 0, 1 or 'dog', 'cat'
-label_list = [0, 1]
+tf.logging.info('prepare training input...')
 
 # Use the InputExample class from BERT's run_classifier code to create examples from the data. Each data point
 # wrapped into a InputExample class
 train_InputExamples = train.apply(lambda x: run_classifier.InputExample(guid=None, # Globally unique ID for bookkeeping, unused in this example
-                                                                   text_a = x[DATA_COLUMN], 
+                                                                   text_a = x['text'],
                                                                    text_b = None, 
-                                                                   label = x[LABEL_COLUMN]), axis = 1)
+                                                                   label = x['label']), axis = 1)
 
 test_InputExamples = test.apply(lambda x: run_classifier.InputExample(guid=None,
-                                                                   text_a = x[DATA_COLUMN], 
+                                                                   text_a = x['text'],
                                                                    text_b = None, 
-                                                                   label = x[LABEL_COLUMN]), axis = 1)
+                                                                   label = x['label']), axis = 1)
 
 
 # <------------------ Prepare tokenizer and do tokenization
 
-BERT_VOCAB= 'data/uncased_L-12_H-768_A-12/vocab.txt'
-BERT_INIT_CHKPNT = 'data/uncased_L-12_H-768_A-12/bert_model'
-BERT_CONFIG = 'data/uncased_L-12_H-768_A-12/bert_config.json'
-
-print('prepare tokenizer')
+tf.logging.info('prepare tokenizer')
 
 # Checks whether the casing config is consistent with the checkpoint name.
-tokenization.validate_case_matches_checkpoint(do_lower_case=True,init_checkpoint=BERT_INIT_CHKPNT)
+tokenization.validate_case_matches_checkpoint(do_lower_case=True,init_checkpoint=FLAGS.BERT_INIT_CHKPNT)
 
 # build the tokenizer
-tokenizer = tokenization.FullTokenizer(vocab_file=BERT_VOCAB,do_lower_case=True)
+tokenizer = tokenization.FullTokenizer(vocab_file=FLAGS.BERT_VOCAB,do_lower_case=True)
 
-print('created tokenizer')
-print('example tokenization:',tokenizer.tokenize("This here's an example of using the BERT tokenizer"))
+tf.logging.info('created tokenizer')
+#tokens_test = tokenizer.tokenize("This here's an example of using the BERT tokenizer")
+#tf.logging.info('example tokenization:'+)
 
-# We'll set sequences to be at most 128 tokens long. Note it includes 2 special tokens: [CLS] and [SEP]
-# I can increase it to 512 for our news data
-MAX_SEQ_LENGTH = 128
+
 
 # Convert our train and test features to InputFeatures that BERT understands.
 # creates lists with elements/sentences of type InputFeatures class
-train_features = run_classifier.convert_examples_to_features(train_InputExamples, label_list, MAX_SEQ_LENGTH, tokenizer)
-test_features = run_classifier.convert_examples_to_features(test_InputExamples, label_list, MAX_SEQ_LENGTH, tokenizer)
+train_features = run_classifier.convert_examples_to_features(train_InputExamples, label_list, FLAGS.MAX_SEQ_LENGTH, tokenizer)
+test_features = run_classifier.convert_examples_to_features(test_InputExamples, label_list, FLAGS.MAX_SEQ_LENGTH, tokenizer)
 
 
 # <------------------ Prepare model
@@ -203,6 +220,20 @@ def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_
       (loss, predicted_labels, log_probs) = create_model(bert_config,
         is_predicting, input_ids, input_mask, segment_ids, label_ids, num_labels)
 
+      if mode == tf.estimator.ModeKeys.TRAIN:
+          # init weights (added CR)
+          tvars = tf.trainable_variables()
+          initialized_variable_names = {}
+          if init_checkpoint:
+              tf.logging.info('start loading weights %d from checkpoint %s' % (len(tvars),init_checkpoint))
+              (assignment_map, initialized_variable_names
+               ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+              # load weight maps
+              tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+              tf.logging.info('loading weights done')
+              tf.logging.info("**** Trainable Variables ****")
+
+
       # creates optimizer operation, based on Adam and exponential decaying lr
       train_op = optimization.create_optimizer(
           loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu=False)
@@ -259,18 +290,7 @@ def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_
             eval_metric_ops=eval_metrics)
     else:
 
-      # init weights (added CR)
-      tvars = tf.trainable_variables()
-      initialized_variable_names = {}
-      tf.logging.info("**** Trainable Variables **** ??? ",init_checkpoint)
-      if init_checkpoint:
-          print('start loading weights ',len(tvars),' from checkpoint ',init_checkpoint)
-          (assignment_map, initialized_variable_names
-           ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-          # load weight maps
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          print('loading weights done')
-          tf.logging.info("**** Trainable Variables ****")
+
 
       # create the model specifically for predictions
       (predicted_labels, log_probs) = create_model(bert_config,
@@ -287,23 +307,13 @@ def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_
 
 
 # Compute train and warmup steps from batch size
-# These hyperparameters are copied from this colab notebook (https://colab.sandbox.google.com/github/tensorflow/tpu/blob/master/tools/colab/bert_finetuning_with_cloud_tpus.ipynb)
-BATCH_SIZE = 32
-LEARNING_RATE = 2e-5
-NUM_TRAIN_EPOCHS = 3.0
-# Warmup is a period of time where hte learning rate 
-# is small and gradually increases--usually helps training.
-WARMUP_PROPORTION = 0.1
-# Model configs
-SAVE_CHECKPOINTS_STEPS = 500
-SAVE_SUMMARY_STEPS = 10
 
 # Compute # train and warmup steps from batch size
-num_train_steps = int(len(train_features) / BATCH_SIZE * NUM_TRAIN_EPOCHS)
-num_warmup_steps = int(num_train_steps * WARMUP_PROPORTION)
+num_train_steps = int(len(train_features) / FLAGS.BATCH_SIZE * FLAGS.NUM_TRAIN_EPOCHS)
+num_warmup_steps = int(num_train_steps * FLAGS.WARMUP_PROPORTION)
 
-print('num warmump steps: ',num_warmup_steps)
-print('num training steps: ',num_train_steps)
+tf.logging.info('num warmump steps: %d' % (num_warmup_steps))
+tf.logging.info('num training steps: %d' % (num_train_steps))
 
 
 # specifies the configurations for an Estimator run.
@@ -312,17 +322,17 @@ print('num training steps: ',num_train_steps)
 # save_summary_steps: Save summaries every this many steps.
 run_config = tf.estimator.RunConfig(
     model_dir=OUTPUT_DIR,
-    save_summary_steps=SAVE_SUMMARY_STEPS,
-    save_checkpoints_steps=SAVE_CHECKPOINTS_STEPS)
+    save_summary_steps=FLAGS.SAVE_SUMMARY_STEPS,
+    save_checkpoints_steps=FLAGS.SAVE_CHECKPOINTS_STEPS)
 
 # build the model
-bert_config = modeling.BertConfig.from_json_file(BERT_CONFIG)
+bert_config = modeling.BertConfig.from_json_file(FLAGS.BERT_CONFIG)
 
 model_fn = model_fn_builder(
   bert_config=bert_config,
-  init_checkpoint = BERT_INIT_CHKPNT,
+  init_checkpoint = FLAGS.BERT_INIT_CHKPNT,
   num_labels=len(label_list),
-  learning_rate=LEARNING_RATE,
+  learning_rate=FLAGS.LEARNING_RATE,
   num_train_steps=num_train_steps,
   num_warmup_steps=num_warmup_steps)
 
@@ -330,27 +340,27 @@ model_fn = model_fn_builder(
 estimator = tf.estimator.Estimator(
   model_fn=model_fn,
   config=run_config,
-  params={"batch_size": BATCH_SIZE})
+  params={"batch_size": FLAGS.BATCH_SIZE})
 
 
 # Create an input function for training. drop_remainder = True for using TPUs.
 train_input_fn = run_classifier.input_fn_builder(
     features=train_features,
-    seq_length=MAX_SEQ_LENGTH,
+    seq_length=FLAGS.MAX_SEQ_LENGTH,
     is_training=True,
     drop_remainder=False)
 
 
 # <------------------ Begin training
 
-print(f'Beginning Training!')
+tf.logging.info(f'Beginning Training!')
 current_time = datetime.now()
 estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-print("Training took time ", datetime.now() - current_time)
+tf.logging.info("Training took time ", datetime.now() - current_time)
 
 test_input_fn = run_classifier.input_fn_builder(
     features=test_features,
-    seq_length=MAX_SEQ_LENGTH,
+    seq_length=FLAGS.MAX_SEQ_LENGTH,
     is_training=False,
     drop_remainder=False)
 
@@ -359,8 +369,8 @@ estimator.evaluate(input_fn=test_input_fn, steps=None)
 def getPrediction(in_sentences):
   labels = ["Negative", "Positive"]
   input_examples = [run_classifier.InputExample(guid="", text_a = x, text_b = None, label = 0) for x in in_sentences] # here, "" is just a dummy label
-  input_features = run_classifier.convert_examples_to_features(input_examples, label_list, MAX_SEQ_LENGTH, tokenizer)
-  predict_input_fn = run_classifier.input_fn_builder(features=input_features, seq_length=MAX_SEQ_LENGTH, is_training=False, drop_remainder=False)
+  input_features = run_classifier.convert_examples_to_features(input_examples, label_list, FLAGS.MAX_SEQ_LENGTH, tokenizer)
+  predict_input_fn = run_classifier.input_fn_builder(features=input_features, seq_length=FLAGS.MAX_SEQ_LENGTH, is_training=False, drop_remainder=False)
   predictions = estimator.predict(predict_input_fn)
   return [(sentence, prediction['probabilities'], labels[prediction['labels']]) for sentence, prediction in zip(in_sentences, predictions)]
 
