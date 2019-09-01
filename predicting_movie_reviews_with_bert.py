@@ -39,9 +39,6 @@ tensorflow.autolog(every_n_iter=1) #default 100
 # ==================================================
 FLAGS = tf.flags.FLAGS
 
-# Set the output directory for saving model file
-OUTPUT_DIR = 'model'#@param {type:"string"}
-
 tf.flags.DEFINE_string("OUTPUT_DIR", 'models/model2',
                        """Path to output dir""")
 tf.flags.DEFINE_string("train_data_file","data/aclImdb/aclImdb_train.csv",
@@ -75,11 +72,14 @@ tf.flags.DEFINE_integer("SAVE_SUMMARY_STEPS",100,
 FLAGS = tf.flags.FLAGS
 FLAGS(sys.argv, known_only=True)
 
+# note that extra FLAGS paramters are saved in run_classifier.py. This were parameters set by Google.
+
 # <--------- run specific settings
 
 FLAGS.SAVE_CHECKPOINTS_STEPS=2
 FLAGS.SAVE_SUMMARY_STEPS=1
-FLAGS.OUTPUT_DIR = 'models/model2'
+FLAGS.OUTPUT_DIR = 'models/model5'
+FLAGS.NUM_TRAIN_EPOCHS = 1
 
 
 
@@ -92,15 +92,15 @@ for key, values in FLAGS.flag_values_dict().items():
 
 tf.gfile.MakeDirs(FLAGS.OUTPUT_DIR)
 
-tf.logging.info('***** Model output directory: {} *****'.format(OUTPUT_DIR))
+tf.logging.info('***** Model output directory: {} *****'.format(FLAGS.OUTPUT_DIR))
 
 # <------------------ Load the data
 
 # Load all files from a directory in a DataFrame.
 train = pd.read_csv(FLAGS.train_data_file)
 test = pd.read_csv(FLAGS.test_data_file)
-train = train.sample(5000)
-test = test.sample(5000)
+train = train.sample(70)
+test = test.sample(70)
 
 # label_list is the list of labels, i.e. True, False or 0, 1 or 'dog', 'cat'
 label_list = list(np.unique(train['label'])) #[0, 1]
@@ -238,12 +238,13 @@ def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_
       train_op = optimization.create_optimizer(
           loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu=False)
 
-      # Calculate evaluation metrics. 
+      # Calculate evaluation metrics.
+      accuracy = tf.metrics.accuracy(label_ids, predicted_labels)
       def metric_fn(label_ids, predicted_labels):
-        accuracy = tf.metrics.accuracy(label_ids, predicted_labels)
         f1_score = tf.contrib.metrics.f1_score(
             label_ids,
             predicted_labels)
+        #mlflow.log_metric('f1_score test',f1_score[1])
         auc = tf.metrics.auc(
             label_ids,
             predicted_labels)
@@ -266,7 +267,7 @@ def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_
             label_ids,
             predicted_labels)
         return {
-            "eval_accuracy": accuracy,
+            #"eval_accuracy": accuracy,
             "f1_score": f1_score,
             "auc": auc,
             "precision": precision,
@@ -278,13 +279,21 @@ def model_fn_builder(bert_config,init_checkpoint,num_labels, learning_rate, num_
         }
 
       eval_metrics = metric_fn(label_ids, predicted_labels)
+      #mlflow.log_metric('eval_metrics recall',eval_metrics['recall'])
+      # this metric will be logging only during evaluation
+      eval_metrics['eval_accuracy'] = accuracy
+
+      # this metric will be logging only during training
+      tf.summary.scalar('accuracy', accuracy[1])
 
       # two mode optoins: TRAIN or EVAL, train here
       if mode == tf.estimator.ModeKeys.TRAIN:
         return tf.estimator.EstimatorSpec(mode=mode,
           loss=loss,
           train_op=train_op)
+          #eval_metric_ops=eval_metrics)
       else:
+          # eval metrics are being printed to tf log output and saved to disk
           return tf.estimator.EstimatorSpec(mode=mode,
             loss=loss,
             eval_metric_ops=eval_metrics)
@@ -321,7 +330,7 @@ tf.logging.info('num training steps: %d' % (num_train_steps))
 # model_dir: directory where model parameters, graph, etc are saved.
 # save_summary_steps: Save summaries every this many steps.
 run_config = tf.estimator.RunConfig(
-    model_dir=OUTPUT_DIR,
+    model_dir=FLAGS.OUTPUT_DIR,
     save_summary_steps=FLAGS.SAVE_SUMMARY_STEPS,
     save_checkpoints_steps=FLAGS.SAVE_CHECKPOINTS_STEPS)
 
@@ -343,6 +352,9 @@ estimator = tf.estimator.Estimator(
   params={"batch_size": FLAGS.BATCH_SIZE})
 
 
+
+# <------------------ Begin training
+
 # Create an input function for training. drop_remainder = True for using TPUs.
 train_input_fn = run_classifier.input_fn_builder(
     features=train_features,
@@ -350,30 +362,56 @@ train_input_fn = run_classifier.input_fn_builder(
     is_training=True,
     drop_remainder=False)
 
-
-# <------------------ Begin training
-
-tf.logging.info(f'Beginning Training!')
+tf.logging.info('Beginning Training!')
 current_time = datetime.now()
 estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-tf.logging.info("Training took time ", datetime.now() - current_time)
+tf.logging.info("Training took time %s" % (datetime.now() - current_time))
 
+
+# <------------------ Begin evaluation on test data
+
+tf.logging.info('Beginning Evaluation!')
 test_input_fn = run_classifier.input_fn_builder(
     features=test_features,
     seq_length=FLAGS.MAX_SEQ_LENGTH,
     is_training=False,
     drop_remainder=False)
 
+current_time = datetime.now()
 estimator.evaluate(input_fn=test_input_fn, steps=None)
+tf.logging.info("evaluation took time %s" % (datetime.now() - current_time))
+
+
+
+# <------------------ Prediction: Apply prediction function to text data
+
 
 def getPrediction(in_sentences):
-  labels = ["Negative", "Positive"]
+  '''
+  Function to provide class predictions for list of input sentences
+  :param in_sentences:
+  :return:
+  '''
+
+  #labels = ["Negative", "Positive"]
+
+  # pre-process input
   input_examples = [run_classifier.InputExample(guid="", text_a = x, text_b = None, label = 0) for x in in_sentences] # here, "" is just a dummy label
   input_features = run_classifier.convert_examples_to_features(input_examples, label_list, FLAGS.MAX_SEQ_LENGTH, tokenizer)
-  predict_input_fn = run_classifier.input_fn_builder(features=input_features, seq_length=FLAGS.MAX_SEQ_LENGTH, is_training=False, drop_remainder=False)
-  predictions = estimator.predict(predict_input_fn)
-  return [(sentence, prediction['probabilities'], labels[prediction['labels']]) for sentence, prediction in zip(in_sentences, predictions)]
 
+  # create model function input
+  predict_input_fn = run_classifier.input_fn_builder(features=input_features, seq_length=FLAGS.MAX_SEQ_LENGTH, is_training=False, drop_remainder=False)
+
+  # calculate the predictions
+  predictions = estimator.predict(predict_input_fn)
+
+  #
+  output =  [(sentence, prediction['probabilities'], prediction['labels']) for sentence, prediction in zip(in_sentences, predictions)]
+  return output
+
+tf.logging.info("start prediction")
+
+# input test sentences
 pred_sentences = [
   "That movie was absolutely awful",
   "The acting was a bit lacking",
@@ -381,6 +419,7 @@ pred_sentences = [
   "Absolutely fantastic!"
 ]
 
+# get predictions for sentences
 predictions = getPrediction(pred_sentences)
 
-predictions
+print(predictions)

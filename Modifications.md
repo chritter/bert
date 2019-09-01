@@ -6,6 +6,8 @@ Christian Ritter
 
 ## Comments
 
+* Implementation is done through the TF Estimator API and a custom Estimator is being built 
+(see https://www.tensorflow.org/guide/custom_estimators)
 *  It is currently not possible to re-produce most of the BERT-Large results on the paper 
 using a GPU with 12GB - 16GB of RAM
 * For fine tuning a GPU like GTX 1080 can be used, easy with our infrastructure 
@@ -13,6 +15,8 @@ using a GPU with 12GB - 16GB of RAM
 * * Signatures: Tensorflow ONLY run those parts of the module that end up as dependencies of a target in tf.Session.run()
 * Modified binary prediction with predicting_movie_reviews_with_ber_hub.py to work with offline tokenizer and model
 * Added multi-label-classification-bert.ipynb from another repo, for potential application in multi-class cases
+* I commented lines 460 in run_classifier.py as this debug information made development difficult
+
 
 ## Model Data
 
@@ -42,8 +46,14 @@ using a GPU with 12GB - 16GB of RAM
     * the cased version is the recommeded one (see github/bert comments)
     * Specs: 104 languages, 12-layer, 768-hidden, 12-heads, 110M parameters, 119547 vocabulary
     * 680Mb
+* BERT-Large, Uncased (Whole Word Masking):
+    * with new technique: whole word masking
+    * much larger in comparison with other models
+    * Sepcs: 24-layer, 1024-hidden, 16-heads, 340M parameters 
+    * 1.2GB
+    * 
     
-   
+    
 ## Input Data
 
 
